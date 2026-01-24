@@ -1,13 +1,42 @@
-import Groq from 'groq-sdk';
 import { logAgentActivity, estimateTokens } from './logger';
 import { buildPromptMessages, truncateConversationHistory, parseLLMResponse } from './prompts';
 import type { ChatMessage, LLMCategorizationResponse } from './types';
 
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY,
-});
-
 const MODEL = 'llama-3.1-8b-instant';
+const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+
+// Helper function to call Groq API directly via fetch
+async function callGroqAPI(messages: Array<{ role: string; content: string }>, temperature: number, maxTokens: number) {
+  const apiKey = process.env.GROQ_API_KEY;
+
+  console.log('GROQ_API_KEY available at runtime:', apiKey ? `Yes (${apiKey.substring(0, 10)}...)` : 'No');
+
+  if (!apiKey) {
+    throw new Error('GROQ_API_KEY is not set');
+  }
+
+  const response = await fetch(GROQ_API_URL, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      messages,
+      temperature,
+      max_tokens: maxTokens,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error('Groq API Error Response:', response.status, errorText);
+    throw new Error(`Groq API error: ${response.status} - ${errorText}`);
+  }
+
+  return response.json();
+}
 
 /**
  * Send a message to the LLM and get a categorization response.
@@ -60,15 +89,14 @@ export async function getChatResponse(
 
     const startTime = Date.now();
 
-    const completion = await groq.chat.completions.create({
-      model: MODEL,
-      messages: messages.map((m) => ({
+    const completion = await callGroqAPI(
+      messages.map((m) => ({
         role: m.role as 'system' | 'user' | 'assistant',
         content: m.content,
       })),
-      temperature: 0.3, // Lower temperature for more consistent categorization
-      max_tokens: 500,
-    });
+      0.3, // Lower temperature for more consistent categorization
+      500
+    );
 
     const responseTime = Date.now() - startTime;
     const responseText = completion.choices[0]?.message?.content || '';
@@ -143,12 +171,25 @@ export async function getChatResponse(
       rawResponse: responseText,
     };
   } catch (error) {
-    const errorMessage = (error as Error).message;
+    const err = error as Error & { status?: number; code?: string };
+    const errorMessage = err.message;
+
+    // Enhanced error logging for debugging
+    console.error('Groq API Error Details:', {
+      message: errorMessage,
+      status: err.status,
+      code: err.code,
+      name: err.name,
+      stack: err.stack?.substring(0, 500),
+    });
 
     await logAgentActivity(
       'llm-error',
       {
         error: errorMessage,
+        errorStatus: err.status,
+        errorCode: err.code,
+        apiKeyPresent: !!process.env.GROQ_API_KEY,
         learningNote:
           '🎓 Error handling: LLM APIs can fail due to rate limits, network issues, or service outages. Always have error handling and graceful degradation.',
       },
@@ -175,7 +216,7 @@ export async function generateWeeklyInsights(
     dislikedMeals: string[];
   }
 ): Promise<string[]> {
-  const prompt = `Based on this user's weekly meal data, provide 3-4 personalized, actionable health insights:
+  const prompt = `Based on this user's weekly meal data, provide 3-4 personalized, actionable health insights.
 
 Weekly Summary:
 - Total meals logged: ${summary.totalMeals}
@@ -187,12 +228,13 @@ User Preferences:
 - Liked meals: ${summary.likedMeals.join(', ') || 'None rated yet'}
 - Disliked meals: ${summary.dislikedMeals.join(', ') || 'None rated yet'}
 
-Provide insights as a JSON array of strings. Focus on:
+Focus on:
 1. Acknowledging positive patterns (especially liked meals)
 2. Gentle suggestions for improvement
 3. Personalized tips based on their preferences
 
-Response format: ["insight 1", "insight 2", "insight 3"]`;
+IMPORTANT: Respond with ONLY a valid JSON array of strings. No explanation, no markdown, no text before or after. Just the array.
+Example: ["First insight here", "Second insight here", "Third insight here"]`;
 
   await logAgentActivity(
     'weekly-summary',
@@ -207,18 +249,25 @@ Response format: ["insight 1", "insight 2", "insight 3"]`;
   );
 
   try {
-    const completion = await groq.chat.completions.create({
-      model: MODEL,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.7,
-      max_tokens: 500,
-    });
+    const completion = await callGroqAPI(
+      [{ role: 'user', content: prompt }],
+      0.7,
+      500
+    );
 
     const responseText = completion.choices[0]?.message?.content || '[]';
-    const cleanedResponse = responseText
+
+    // Clean up the response - remove markdown code blocks
+    let cleanedResponse = responseText
       .replace(/```json\n?/g, '')
       .replace(/```\n?/g, '')
       .trim();
+
+    // Try to extract JSON array if there's extra text around it
+    const jsonArrayMatch = cleanedResponse.match(/\[[\s\S]*\]/);
+    if (jsonArrayMatch) {
+      cleanedResponse = jsonArrayMatch[0];
+    }
 
     const insights = JSON.parse(cleanedResponse);
     return Array.isArray(insights) ? insights : [];
