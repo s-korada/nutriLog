@@ -1,9 +1,122 @@
 import { logAgentActivity, estimateTokens } from './logger';
-import { buildPromptMessages, truncateConversationHistory, parseLLMResponse } from './prompts';
+import { buildPromptMessages, truncateConversationHistory, parseLLMResponse, SYSTEM_PROMPT, ParsedLLMResponse } from './prompts';
 import type { ChatMessage, LLMCategorizationResponse } from './types';
 
 const MODEL = 'llama-3.1-8b-instant';
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const MAX_CONTEXT_WINDOW = 128000; // Llama 3.1 8B context window
+
+/**
+ * Analyze LLM response to understand why it made certain decisions.
+ */
+function analyzeResponse(parsed: ParsedLLMResponse, conversationHistory: ChatMessage[]): {
+  decision: string;
+  reason: string;
+  keySignals: string[];
+  confidence: string;
+} {
+  const keySignals: string[] = [];
+
+  // Extract key signals from conversation that led to the decision
+  for (const msg of conversationHistory) {
+    if (msg.role === 'user') {
+      const content = msg.content.toLowerCase();
+      // Look for source indicators
+      if (content.includes('local') || content.includes('market') || content.includes('fresh')) {
+        keySignals.push(`User mentioned "local/market/fresh" → indicates non-processed`);
+      }
+      if (content.includes('packaged') || content.includes('amul') || content.includes('aashirvaad') || content.includes('maggi')) {
+        keySignals.push(`User mentioned brand/packaged → indicates processed`);
+      }
+      if (content.includes('order') || content.includes('zomato') || content.includes('swiggy') || content.includes('restaurant')) {
+        keySignals.push(`User mentioned ordering/restaurant → indicates restaurant`);
+      }
+      if (content.includes('homemade') || content.includes('home') || content.includes('made')) {
+        keySignals.push(`User mentioned homemade → indicates non-processed`);
+      }
+    }
+  }
+
+  // Determine confidence based on clarity of signals
+  let confidence = 'medium';
+  if (keySignals.length >= 2) confidence = 'high';
+  if (keySignals.length === 0) confidence = 'low';
+
+  if (parsed.isComplete) {
+    if (parsed.components && parsed.components.length > 0) {
+      return {
+        decision: `Categorized ${parsed.components.length} component(s) → ${parsed.overall_category}`,
+        reason: parsed.components.map(c => `${c.name}: ${c.reasoning}`).join('; '),
+        keySignals,
+        confidence,
+      };
+    }
+    return {
+      decision: `Single category: ${parsed.category}`,
+      reason: parsed.reasoning || 'No reasoning provided',
+      keySignals,
+      confidence,
+    };
+  }
+
+  return {
+    decision: 'Needs more info',
+    reason: `Asking: ${parsed.followUpQuestion}`,
+    keySignals,
+    confidence: 'pending',
+  };
+}
+
+/**
+ * Extract key signals from the conversation that influenced categorization.
+ */
+function extractKeySignals(conversationHistory: ChatMessage[], category: string): string[] {
+  const signals: string[] = [];
+  const categoryKeywords: Record<string, string[]> = {
+    non_processed: ['local', 'market', 'fresh', 'homemade', 'home', 'loose', 'vendor', 'butcher'],
+    restaurant: ['order', 'zomato', 'swiggy', 'restaurant', 'delivery', 'takeout', 'cafe'],
+    processed: ['packaged', 'amul', 'aashirvaad', 'maggi', 'britannia', 'store-bought', 'supermarket'],
+  };
+
+  const keywords = categoryKeywords[category] || [];
+
+  for (const msg of conversationHistory) {
+    if (msg.role === 'user') {
+      for (const keyword of keywords) {
+        if (msg.content.toLowerCase().includes(keyword)) {
+          signals.push(`"${keyword}" found in: "${msg.content.substring(0, 50)}..."`);
+        }
+      }
+    }
+  }
+
+  return signals;
+}
+
+/**
+ * Estimate confidence level based on conversation clarity.
+ */
+function estimateConfidence(parsed: ParsedLLMResponse, conversationHistory: ChatMessage[]): string {
+  if (!parsed.isComplete) return 'pending';
+
+  const turnCount = conversationHistory.length / 2;
+
+  // More turns usually means more certainty
+  if (turnCount >= 3) return 'high';
+  if (turnCount >= 1) return 'medium';
+
+  // Single turn with clear indicators
+  const lastUserMsg = conversationHistory.filter(m => m.role === 'user').pop();
+  if (lastUserMsg) {
+    const content = lastUserMsg.content.toLowerCase();
+    const clearIndicators = ['maggi', 'zomato', 'swiggy', 'restaurant', 'homemade', 'ordered'];
+    if (clearIndicators.some(ind => content.includes(ind))) {
+      return 'high';
+    }
+  }
+
+  return 'medium';
+}
 
 // Helper function to call Groq API directly via fetch
 async function callGroqAPI(messages: Array<{ role: string; content: string }>, temperature: number, maxTokens: number) {
@@ -54,23 +167,45 @@ export async function getChatResponse(
 }> {
   // Truncate conversation history to manage context window
   const truncatedHistory = truncateConversationHistory(conversationHistory);
+  const wasTruncated = conversationHistory.length > truncatedHistory.length;
 
   // Build the prompt messages
   const messages = buildPromptMessages(truncatedHistory, userMessage);
 
-  // Log prompt construction
-  const fullPromptText = messages.map((m) => m.content).join('\n');
+  // Calculate token estimates for each part
+  const systemPromptTokens = estimateTokens(SYSTEM_PROMPT);
+  const historyText = truncatedHistory.map(m => m.content).join('\n');
+  const historyTokens = estimateTokens(historyText);
+  const userMessageTokens = estimateTokens(userMessage);
+  const totalEstimatedTokens = systemPromptTokens + historyTokens + userMessageTokens;
+  const contextUsagePercent = ((totalEstimatedTokens / MAX_CONTEXT_WINDOW) * 100).toFixed(2);
+
+  // v1.1: Enhanced logging with full prompt details
   await logAgentActivity(
-    'prompt-construction',
+    'prompt_constructed',
     {
-      conversationTurns: truncatedHistory.length / 2,
-      systemPromptIncluded: true,
-      newMessageLength: userMessage.length,
-      estimatedTokens: estimateTokens(fullPromptText),
-      learningNote:
-        '🎓 Context window management: We include the system prompt + conversation history + new message. The LLM is stateless, so we must send the full context each time.',
+      learningNote: '🎓 Full prompt construction: This is EXACTLY what the LLM sees. The system prompt defines its personality and rules, conversation history provides context, and the new message is what it needs to respond to.',
+      fullPrompt: {
+        systemPrompt: SYSTEM_PROMPT,
+        conversationHistory: truncatedHistory,
+        newUserMessage: userMessage,
+      },
+      promptStructure: {
+        systemPromptTokens,
+        historyTokens,
+        userMessageTokens,
+        totalEstimatedTokens,
+      },
+      contextWindowInfo: {
+        maxContextWindow: MAX_CONTEXT_WINDOW,
+        currentUsage: totalEstimatedTokens,
+        percentageUsed: `${contextUsagePercent}%`,
+        turnsIncluded: truncatedHistory.length / 2,
+        truncationApplied: wasTruncated ? 'Yes' : 'No',
+      },
     },
-    mealId
+    mealId,
+    'debug'
   );
 
   try {
@@ -80,7 +215,8 @@ export async function getChatResponse(
       {
         model: MODEL,
         messageCount: messages.length,
-        estimatedInputTokens: estimateTokens(fullPromptText),
+        estimatedInputTokens: totalEstimatedTokens,
+        contextUsage: `${contextUsagePercent}% of ${MAX_CONTEXT_WINDOW} tokens`,
         learningNote:
           '🎓 API call: Sending request to Groq API. The model will process our prompt and generate a response based on the full context we provided.',
       },
@@ -101,30 +237,45 @@ export async function getChatResponse(
     const responseTime = Date.now() - startTime;
     const responseText = completion.choices[0]?.message?.content || '';
 
-    // Log LLM response
-    await logAgentActivity(
-      'llm-response',
-      {
-        model: MODEL,
-        responseTime,
-        responseTokens: completion.usage?.completion_tokens || 0,
-        totalTokens: completion.usage?.total_tokens || 0,
-        rawResponse: responseText.substring(0, 500), // Truncate for logging
-        learningNote:
-          '🎓 Response received: The LLM generated a response. We now need to parse and validate this JSON to ensure it matches our expected format.',
-      },
-      mealId
-    );
-
     // Parse and validate the response
     const parseResult = parseLLMResponse(responseText);
+
+    // v1.1: Enhanced response logging with analysis
+    const analysis = parseResult.success && parseResult.data
+      ? analyzeResponse(parseResult.data, truncatedHistory)
+      : null;
+
+    await logAgentActivity(
+      'llm_response_received',
+      {
+        model: MODEL,
+        performance: {
+          responseTimeMs: responseTime,
+          inputTokens: completion.usage?.prompt_tokens || totalEstimatedTokens,
+          outputTokens: completion.usage?.completion_tokens || 0,
+          totalTokens: completion.usage?.total_tokens || 0,
+        },
+        rawResponse: responseText,
+        parsedSuccessfully: parseResult.success,
+        reasoningAnalysis: analysis ? {
+          decision: analysis.decision,
+          reason: analysis.reason,
+          keySignals: analysis.keySignals,
+          confidence: analysis.confidence,
+        } : null,
+        learningNote:
+          '🎓 Response received: The LLM generated a response. The reasoning analysis shows what signals in the conversation led to this decision.',
+      },
+      mealId,
+      'debug'
+    );
 
     if (!parseResult.success) {
       await logAgentActivity(
         'validation-error',
         {
           error: parseResult.error,
-          rawResponse: responseText.substring(0, 200),
+          rawResponse: responseText.substring(0, 500),
           learningNote:
             '🎓 Validation failed: LLMs can return unexpected formats. Always validate and have fallback behavior.',
         },
@@ -141,14 +292,29 @@ export async function getChatResponse(
 
     // Log the categorization decision if complete
     if (parseResult.data?.isComplete) {
+      const keySignals = parseResult.data.components
+        ? parseResult.data.components.flatMap(c => extractKeySignals(truncatedHistory, c.category))
+        : extractKeySignals(truncatedHistory, parseResult.data.category || '');
+
       await logAgentActivity(
         'categorization-decision',
         {
+          // v1.1: Component-based categorization
+          components: parseResult.data.components,
+          overall_category: parseResult.data.overall_category,
+          // Legacy fields
           category: parseResult.data.category,
           reasoning: parseResult.data.reasoning,
-          nutritionEstimate: parseResult.data.nutritionEstimate,
+          nutritionEstimate: parseResult.data.nutritionEstimate || {
+            calories: parseResult.data.calories,
+            protein: parseResult.data.protein,
+            carbs: parseResult.data.carbs,
+            fats: parseResult.data.fats,
+          },
+          keySignals,
+          confidence: estimateConfidence(parseResult.data, truncatedHistory),
           learningNote:
-            '🎓 Categorization complete: The agent has gathered enough information to make a decision. The reasoning field shows the agent\'s thought process.',
+            '🎓 Categorization complete: The agent has gathered enough information to make a decision. Key signals show what words/phrases in the conversation influenced the categorization.',
         },
         mealId
       );
@@ -158,6 +324,7 @@ export async function getChatResponse(
         {
           question: parseResult.data?.followUpQuestion,
           conversationLength: conversationHistory.length + 1,
+          turnsElapsed: Math.floor(conversationHistory.length / 2),
           learningNote:
             '🎓 Information gathering: The agent needs more info to categorize accurately. It\'s asking a targeted follow-up question based on the conversation context.',
         },

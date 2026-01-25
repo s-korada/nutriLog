@@ -2,6 +2,8 @@ import {
   buildPromptMessages,
   truncateConversationHistory,
   isValidCategory,
+  isValidOverallCategory,
+  calculateOverallCategory,
   parseLLMResponse,
   SYSTEM_PROMPT,
 } from '@/lib/prompts';
@@ -18,7 +20,19 @@ describe('prompts', () => {
     it('should define JSON response format', () => {
       expect(SYSTEM_PROMPT).toContain('isComplete');
       expect(SYSTEM_PROMPT).toContain('followUpQuestion');
-      expect(SYSTEM_PROMPT).toContain('category');
+      expect(SYSTEM_PROMPT).toContain('components');
+    });
+
+    it('should contain v1.1 component-based format', () => {
+      expect(SYSTEM_PROMPT).toContain('overall_category');
+      expect(SYSTEM_PROMPT).toContain('home_cooked');
+      expect(SYSTEM_PROMPT).toContain('mixed');
+    });
+
+    it('should contain Indian food examples', () => {
+      expect(SYSTEM_PROMPT).toContain('Maggi');
+      expect(SYSTEM_PROMPT).toContain('biryani');
+      expect(SYSTEM_PROMPT).toContain('paratha');
     });
   });
 
@@ -97,8 +111,68 @@ describe('prompts', () => {
     });
   });
 
+  describe('isValidOverallCategory', () => {
+    it('should return true for valid overall categories', () => {
+      expect(isValidOverallCategory('home_cooked')).toBe(true);
+      expect(isValidOverallCategory('mixed')).toBe(true);
+      expect(isValidOverallCategory('restaurant')).toBe(true);
+      expect(isValidOverallCategory('processed')).toBe(true);
+    });
+
+    it('should return false for invalid overall categories', () => {
+      expect(isValidOverallCategory('non_processed')).toBe(false);
+      expect(isValidOverallCategory('invalid')).toBe(false);
+      expect(isValidOverallCategory('')).toBe(false);
+    });
+  });
+
+  describe('calculateOverallCategory', () => {
+    it('should return home_cooked when all components are non_processed', () => {
+      const components = [
+        { category: 'non_processed' as const },
+        { category: 'non_processed' as const },
+      ];
+      expect(calculateOverallCategory(components)).toBe('home_cooked');
+    });
+
+    it('should return restaurant when all components are restaurant', () => {
+      const components = [
+        { category: 'restaurant' as const },
+        { category: 'restaurant' as const },
+      ];
+      expect(calculateOverallCategory(components)).toBe('restaurant');
+    });
+
+    it('should return processed when all components are processed', () => {
+      const components = [
+        { category: 'processed' as const },
+        { category: 'processed' as const },
+      ];
+      expect(calculateOverallCategory(components)).toBe('processed');
+    });
+
+    it('should return mixed when components have different categories', () => {
+      const components = [
+        { category: 'non_processed' as const },
+        { category: 'processed' as const },
+      ];
+      expect(calculateOverallCategory(components)).toBe('mixed');
+    });
+
+    it('should return mixed for empty components', () => {
+      expect(calculateOverallCategory([])).toBe('mixed');
+    });
+
+    it('should handle single component correctly', () => {
+      expect(calculateOverallCategory([{ category: 'non_processed' as const }])).toBe('home_cooked');
+      expect(calculateOverallCategory([{ category: 'restaurant' as const }])).toBe('restaurant');
+      expect(calculateOverallCategory([{ category: 'processed' as const }])).toBe('processed');
+    });
+  });
+
   describe('parseLLMResponse', () => {
-    it('should parse valid complete response', () => {
+    // Legacy single-category responses
+    it('should parse valid legacy complete response', () => {
       const response = JSON.stringify({
         isComplete: true,
         category: 'processed',
@@ -146,7 +220,7 @@ describe('prompts', () => {
       expect(result.error).toContain('isComplete');
     });
 
-    it('should return error for invalid category when complete', () => {
+    it('should return error for invalid category when complete (legacy)', () => {
       const response = JSON.stringify({
         isComplete: true,
         category: 'invalid_category',
@@ -165,6 +239,105 @@ describe('prompts', () => {
       const result = parseLLMResponse(response);
       expect(result.success).toBe(false);
       expect(result.error).toContain('follow-up');
+    });
+
+    // v1.1: Component-based responses
+    it('should parse valid component-based response', () => {
+      const response = JSON.stringify({
+        isComplete: true,
+        components: [
+          { name: 'paratha', category: 'non_processed', reasoning: 'Homemade' },
+          { name: 'curd', category: 'processed', reasoning: 'Amul brand' },
+        ],
+        overall_category: 'mixed',
+        calories: 400,
+        protein: 15,
+        carbs: 50,
+        fats: 12,
+      });
+
+      const result = parseLLMResponse(response);
+      expect(result.success).toBe(true);
+      expect(result.data?.isComplete).toBe(true);
+      expect(result.data?.components).toHaveLength(2);
+      expect(result.data?.overall_category).toBe('mixed');
+      expect(result.data?.calories).toBe(400);
+    });
+
+    it('should calculate overall_category if not provided', () => {
+      const response = JSON.stringify({
+        isComplete: true,
+        components: [
+          { name: 'rice', category: 'non_processed', reasoning: 'Homemade' },
+          { name: 'dal', category: 'non_processed', reasoning: 'Homemade' },
+        ],
+        calories: 500,
+      });
+
+      const result = parseLLMResponse(response);
+      expect(result.success).toBe(true);
+      expect(result.data?.overall_category).toBe('home_cooked');
+    });
+
+    it('should validate component categories', () => {
+      const response = JSON.stringify({
+        isComplete: true,
+        components: [
+          { name: 'paratha', category: 'invalid_category', reasoning: 'Test' },
+        ],
+        overall_category: 'mixed',
+      });
+
+      const result = parseLLMResponse(response);
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Invalid category');
+    });
+
+    it('should validate component has name', () => {
+      const response = JSON.stringify({
+        isComplete: true,
+        components: [
+          { category: 'non_processed', reasoning: 'Test' },
+        ],
+        overall_category: 'home_cooked',
+      });
+
+      const result = parseLLMResponse(response);
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('name');
+    });
+
+    it('should validate overall_category value', () => {
+      const response = JSON.stringify({
+        isComplete: true,
+        components: [
+          { name: 'rice', category: 'non_processed', reasoning: 'Test' },
+        ],
+        overall_category: 'invalid_overall',
+      });
+
+      const result = parseLLMResponse(response);
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('overall_category');
+    });
+
+    it('should handle single component response', () => {
+      const response = JSON.stringify({
+        isComplete: true,
+        components: [
+          { name: 'Maggi noodles', category: 'processed', reasoning: 'Packaged instant noodles' },
+        ],
+        overall_category: 'processed',
+        calories: 420,
+        protein: 9,
+        carbs: 58,
+        fats: 17,
+      });
+
+      const result = parseLLMResponse(response);
+      expect(result.success).toBe(true);
+      expect(result.data?.components).toHaveLength(1);
+      expect(result.data?.overall_category).toBe('processed');
     });
   });
 });

@@ -70,25 +70,37 @@ function generateLogMessage(logType: string, metadata: Record<string, unknown>):
       return `New conversation started. ${learningNote}`;
 
     case 'prompt-construction':
-      return `Constructing prompt with ${metadata.conversationTurns || 0} turns. ${learningNote}`;
+    case 'prompt_constructed':
+      const contextInfo = metadata.contextWindowInfo as { percentageUsed?: string; turnsIncluded?: number } | undefined;
+      return `Prompt constructed: ${contextInfo?.percentageUsed || '?'}% context used, ${contextInfo?.turnsIncluded || 0} turns. ${learningNote}`;
 
     case 'llm-request':
       return `Sending request to LLM (${metadata.model || 'unknown'}). ${learningNote}`;
 
     case 'llm-response':
-      return `Received LLM response (${metadata.responseTokens || 0} tokens). ${learningNote}`;
+    case 'llm_response_received':
+      const perf = metadata.performance as { responseTimeMs?: number; outputTokens?: number } | undefined;
+      return `LLM response received (${perf?.outputTokens || 0} tokens, ${perf?.responseTimeMs || 0}ms). ${learningNote}`;
 
     case 'llm-error':
       return `LLM error: ${metadata.error || 'unknown'}. ${learningNote}`;
 
     case 'categorization-decision':
+      const components = metadata.components as Array<{ name: string }> | undefined;
+      if (components && components.length > 0) {
+        return `Categorized ${components.length} component(s) → ${metadata.overall_category}. ${learningNote}`;
+      }
       return `Categorized meal as ${metadata.category || 'unknown'}. ${learningNote}`;
 
     case 'follow-up-question':
-      return `Agent asking follow-up question. ${learningNote}`;
+      return `Agent asking follow-up question (turn ${metadata.turnsElapsed || 0}). ${learningNote}`;
 
     case 'meal-complete':
-      return `Meal logging complete. Category: ${metadata.category}. ${learningNote}`;
+      return `Meal logging complete. Category: ${metadata.overall_category || metadata.category}. ${learningNote}`;
+
+    case 'meal_components_saved':
+      const comps = metadata.components as Array<{ name: string }> | undefined;
+      return `Saved ${comps?.length || 0} meal components. Overall: ${metadata.overall_category}. ${learningNote}`;
 
     case 'rating-submitted':
       return `User rated meal as ${metadata.rating || 'unknown'}. ${learningNote}`;
@@ -100,7 +112,7 @@ function generateLogMessage(logType: string, metadata: Record<string, unknown>):
       return `Database error: ${metadata.operation || 'unknown operation'}. ${learningNote}`;
 
     case 'validation-error':
-      return `Validation error: ${metadata.field || 'unknown field'}. ${learningNote}`;
+      return `Validation error: ${metadata.error || metadata.field || 'unknown'}. ${learningNote}`;
 
     default:
       return `${logType}: ${JSON.stringify(metadata).substring(0, 100)}`;

@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { supabase, getDefaultUser } from '@/lib/supabase';
 import { getChatResponse } from '@/lib/groq';
 import { logAgentActivity } from '@/lib/logger';
-import type { ChatMessage, ChatRequest, ChatResponse } from '@/lib/types';
+import { calculateOverallCategory } from '@/lib/prompts';
+import type { ChatMessage, ChatRequest, ChatResponse, MealCategory, OverallCategory } from '@/lib/types';
 
 export async function POST(request: NextRequest) {
   try {
@@ -103,22 +104,65 @@ export async function POST(request: NextRequest) {
       } as ChatResponse);
     }
 
-    const { isComplete, followUpQuestion, category, nutritionEstimate, reasoning } =
-      llmResult.data;
+    const {
+      isComplete,
+      followUpQuestion,
+      // Legacy fields
+      category,
+      nutritionEstimate,
+      reasoning,
+      // v1.1: Component-based fields
+      components,
+      overall_category,
+      calories,
+      protein,
+      carbs,
+      fats,
+    } = llmResult.data;
 
     // Determine the response text
     let responseText: string;
 
-    if (isComplete && category) {
+    if (isComplete && (components || category)) {
+      // v1.1: Handle component-based response
+      let finalCategory: MealCategory;
+      let finalOverallCategory: OverallCategory;
+      let finalCalories: number | undefined;
+      let finalProtein: number | undefined;
+      let finalCarbs: number | undefined;
+      let finalFats: number | undefined;
+
+      if (components && components.length > 0) {
+        // Component-based: calculate overall category from components
+        finalOverallCategory = overall_category || calculateOverallCategory(components);
+        // For legacy category field, use first component's category or derive from overall
+        finalCategory = components.length === 1
+          ? components[0].category
+          : (finalOverallCategory === 'home_cooked' ? 'non_processed' : finalOverallCategory === 'mixed' ? 'non_processed' : finalOverallCategory as MealCategory);
+        finalCalories = calories;
+        finalProtein = protein;
+        finalCarbs = carbs;
+        finalFats = fats;
+      } else {
+        // Legacy single-category response
+        finalCategory = category!;
+        finalOverallCategory = category === 'non_processed' ? 'home_cooked' : category as OverallCategory;
+        finalCalories = nutritionEstimate?.calories;
+        finalProtein = nutritionEstimate?.protein;
+        finalCarbs = nutritionEstimate?.carbs;
+        finalFats = nutritionEstimate?.fats;
+      }
+
       // Update meal with final category and nutrition
       const { error: updateError } = await supabase
         .from('meals')
         .update({
-          category,
-          estimated_calories: nutritionEstimate?.calories,
-          estimated_protein: nutritionEstimate?.protein,
-          estimated_carbs: nutritionEstimate?.carbs,
-          estimated_fats: nutritionEstimate?.fats,
+          category: finalCategory,
+          overall_category: finalOverallCategory,
+          estimated_calories: finalCalories,
+          estimated_protein: finalProtein,
+          estimated_carbs: finalCarbs,
+          estimated_fats: finalFats,
         })
         .eq('id', currentMealId);
 
@@ -131,12 +175,54 @@ export async function POST(request: NextRequest) {
         );
       }
 
+      // v1.1: Save meal components if present
+      if (components && components.length > 0) {
+        const componentInserts = components.map((comp) => ({
+          meal_id: currentMealId,
+          component_name: comp.name,
+          category: comp.category,
+          reasoning: comp.reasoning,
+        }));
+
+        const { error: componentError } = await supabase
+          .from('meal_components')
+          .insert(componentInserts);
+
+        if (componentError) {
+          await logAgentActivity(
+            'database-error',
+            { operation: 'save meal components', error: componentError.message },
+            currentMealId,
+            'error'
+          );
+        } else {
+          await logAgentActivity(
+            'meal_components_saved',
+            {
+              mealId: currentMealId,
+              components: components,
+              overall_category: finalOverallCategory,
+              learningNote:
+                '🎓 Component breakdown: The meal was split into individual items, each categorized separately. This allows for more accurate tracking of food sources.',
+            },
+            currentMealId
+          );
+        }
+      }
+
       // Log meal completion
       await logAgentActivity(
         'meal-complete',
         {
-          category,
-          nutritionEstimate,
+          category: finalCategory,
+          overall_category: finalOverallCategory,
+          components: components,
+          nutritionEstimate: {
+            calories: finalCalories,
+            protein: finalProtein,
+            carbs: finalCarbs,
+            fats: finalFats,
+          },
           reasoning,
           learningNote:
             '🎓 Meal logged: The agent has categorized the meal and estimated nutrition. The conversation is complete.',
@@ -145,17 +231,22 @@ export async function POST(request: NextRequest) {
       );
 
       // Generate a friendly completion message
-      const categoryLabels = {
-        non_processed: 'home-cooked/non-processed',
+      const overallCategoryLabels: Record<OverallCategory, string> = {
+        home_cooked: 'home-cooked',
+        mixed: 'mixed (home-cooked + processed)',
         restaurant: 'restaurant',
         processed: 'processed',
       };
 
-      responseText = `Great! I've logged your meal as ${categoryLabels[category]}. ${
-        nutritionEstimate
-          ? `Estimated: ${nutritionEstimate.calories} calories, ${nutritionEstimate.protein}g protein.`
+      const componentSummary = components && components.length > 1
+        ? ` (${components.length} items: ${components.map(c => c.name).join(', ')})`
+        : '';
+
+      responseText = `Great! I've logged your meal as ${overallCategoryLabels[finalOverallCategory]}${componentSummary}. ${
+        finalCalories
+          ? `Estimated: ${finalCalories} calories, ${finalProtein}g protein.`
           : ''
-      } Would you like to rate this meal? 👍👎`;
+      } Would you like to rate this meal?`;
     } else {
       responseText = followUpQuestion || 'Could you tell me more about this meal?';
     }
@@ -167,13 +258,30 @@ export async function POST(request: NextRequest) {
       content: responseText,
     });
 
-    return NextResponse.json({
+    // Build response with v1.1 component data
+    const response: ChatResponse = {
       response: responseText,
-      mealId: currentMealId,
+      mealId: currentMealId || undefined,
       isComplete: isComplete || false,
-      category: isComplete ? category : undefined,
-      nutritionEstimate: isComplete ? nutritionEstimate : undefined,
-    } as ChatResponse);
+    };
+
+    if (isComplete) {
+      if (components && components.length > 0) {
+        response.components = components;
+        response.overall_category = overall_category || calculateOverallCategory(components);
+        response.nutritionEstimate = {
+          calories: calories || 0,
+          protein: protein || 0,
+          carbs: carbs || 0,
+          fats: fats || 0,
+        };
+      } else if (category) {
+        response.category = category;
+        response.nutritionEstimate = nutritionEstimate;
+      }
+    }
+
+    return NextResponse.json(response);
   } catch (error) {
     console.error('Chat API error:', error);
     return NextResponse.json(

@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { supabase, getDefaultUser } from '@/lib/supabase';
 import { generateWeeklyInsights } from '@/lib/groq';
-import type { Meal, MealSummary } from '@/lib/types';
+import type { Meal, MealComponent, WeeklySummaryV2, ComponentStats, MealStats, OverallCategory } from '@/lib/types';
 
-// GET /api/meals/summary - Get weekly summary with insights
+// GET /api/meals/summary - Get weekly summary with component stats
 export async function GET(request: NextRequest) {
   try {
     const user = await getDefaultUser();
@@ -17,26 +17,96 @@ export async function GET(request: NextRequest) {
 
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - days);
+    const endDate = new Date();
 
-    const { data: meals, error } = await supabase
+    // Fetch meals with their components
+    const { data: meals, error: mealsError } = await supabase
       .from('meals')
       .select('*')
       .eq('user_id', user.id)
       .gte('logged_at', startDate.toISOString())
       .order('logged_at', { ascending: false });
 
-    if (error) {
-      console.error('Error fetching meals for summary:', error);
+    if (mealsError) {
+      console.error('Error fetching meals for summary:', mealsError);
       return NextResponse.json({ error: 'Failed to fetch meals' }, { status: 500 });
     }
 
     const typedMeals = meals as Meal[];
+    const mealIds = typedMeals.map((m) => m.id);
 
-    // Calculate summary statistics
-    const byCategory = {
-      non_processed: 0,
-      restaurant: 0,
-      processed: 0,
+    // Fetch all components for these meals
+    let components: MealComponent[] = [];
+    if (mealIds.length > 0) {
+      const { data: comps, error: compsError } = await supabase
+        .from('meal_components')
+        .select('*')
+        .in('meal_id', mealIds);
+
+      if (compsError) {
+        console.error('Error fetching meal components:', compsError);
+      } else {
+        components = comps as MealComponent[];
+      }
+    }
+
+    // Group components by meal
+    const componentsByMeal = new Map<string, MealComponent[]>();
+    for (const comp of components) {
+      const existing = componentsByMeal.get(comp.meal_id) || [];
+      existing.push(comp);
+      componentsByMeal.set(comp.meal_id, existing);
+    }
+
+    // Attach components to meals
+    const mealsWithComponents = typedMeals.map((meal) => ({
+      ...meal,
+      components: componentsByMeal.get(meal.id) || [],
+    }));
+
+    // Calculate component-level statistics
+    const componentStats: ComponentStats = {
+      total: components.length,
+      byCategory: {
+        non_processed: 0,
+        restaurant: 0,
+        processed: 0,
+      },
+      percentages: {
+        non_processed: '0',
+        restaurant: '0',
+        processed: '0',
+      },
+    };
+
+    for (const comp of components) {
+      if (comp.category in componentStats.byCategory) {
+        componentStats.byCategory[comp.category as keyof typeof componentStats.byCategory]++;
+      }
+    }
+
+    // Calculate percentages
+    if (componentStats.total > 0) {
+      componentStats.percentages.non_processed = (
+        (componentStats.byCategory.non_processed / componentStats.total) * 100
+      ).toFixed(1);
+      componentStats.percentages.restaurant = (
+        (componentStats.byCategory.restaurant / componentStats.total) * 100
+      ).toFixed(1);
+      componentStats.percentages.processed = (
+        (componentStats.byCategory.processed / componentStats.total) * 100
+      ).toFixed(1);
+    }
+
+    // Calculate meal-level statistics (by overall_category)
+    const mealStats: MealStats = {
+      total: typedMeals.length,
+      byCategory: {
+        home_cooked: 0,
+        mixed: 0,
+        restaurant: 0,
+        processed: 0,
+      },
     };
 
     const byRating = {
@@ -47,22 +117,21 @@ export async function GET(request: NextRequest) {
 
     let totalCalories = 0;
     let mealsWithCalories = 0;
-    const likedMeals: Meal[] = [];
-    const dislikedMeals: Meal[] = [];
 
-    typedMeals.forEach((meal) => {
-      // Count by category
-      if (meal.category in byCategory) {
-        byCategory[meal.category]++;
+    for (const meal of typedMeals) {
+      // Count by overall_category (fallback to deriving from category)
+      const overallCat: OverallCategory = meal.overall_category ||
+        (meal.category === 'non_processed' ? 'home_cooked' : meal.category as OverallCategory);
+
+      if (overallCat in mealStats.byCategory) {
+        mealStats.byCategory[overallCat]++;
       }
 
       // Count by rating
       if (meal.rating === 'liked') {
         byRating.liked++;
-        likedMeals.push(meal);
       } else if (meal.rating === 'disliked') {
         byRating.disliked++;
-        dislikedMeals.push(meal);
       } else {
         byRating.unrated++;
       }
@@ -72,28 +141,38 @@ export async function GET(request: NextRequest) {
         totalCalories += meal.estimated_calories;
         mealsWithCalories++;
       }
-    });
+    }
 
     const averageCalories =
       mealsWithCalories > 0 ? Math.round(totalCalories / mealsWithCalories) : 0;
 
     // Generate personalized insights using LLM
+    const likedMeals = typedMeals.filter((m) => m.rating === 'liked');
+    const dislikedMeals = typedMeals.filter((m) => m.rating === 'disliked');
+
     const insights = await generateWeeklyInsights({
       totalMeals: typedMeals.length,
-      byCategory,
+      byCategory: {
+        non_processed: mealStats.byCategory.home_cooked,
+        restaurant: mealStats.byCategory.restaurant,
+        processed: mealStats.byCategory.processed + mealStats.byCategory.mixed,
+      },
       byRating,
       likedMeals: likedMeals.map((m) => m.meal_description),
       dislikedMeals: dislikedMeals.map((m) => m.meal_description),
     });
 
-    const summary: MealSummary = {
-      totalMeals: typedMeals.length,
-      byCategory,
+    const summary: WeeklySummaryV2 = {
+      dateRange: {
+        start: startDate.toISOString(),
+        end: endDate.toISOString(),
+      },
+      componentStats,
+      meals: mealsWithComponents,
+      mealStats,
       byRating,
       averageCalories,
       insights,
-      likedMeals,
-      dislikedMeals,
     };
 
     return NextResponse.json({ summary });
