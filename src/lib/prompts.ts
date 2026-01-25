@@ -175,6 +175,7 @@ export interface ParsedLLMResponse {
 /**
  * Parse and validate LLM JSON response with error handling.
  * Supports both legacy single-category and v1.1 component-based formats.
+ * Falls back to treating plain text as a follow-up question.
  */
 export function parseLLMResponse(responseText: string): {
   success: boolean;
@@ -188,7 +189,11 @@ export function parseLLMResponse(responseText: string): {
       .replace(/```\n?/g, '')
       .trim();
 
-    const parsed = JSON.parse(cleanedResponse);
+    // Try to find JSON in the response (in case there's text before/after)
+    const jsonMatch = cleanedResponse.match(/\{[\s\S]*\}/);
+    const jsonToParse = jsonMatch ? jsonMatch[0] : cleanedResponse;
+
+    const parsed = JSON.parse(jsonToParse);
 
     // Validate required fields
     if (typeof parsed.isComplete !== 'boolean') {
@@ -234,7 +239,22 @@ export function parseLLMResponse(responseText: string): {
     }
 
     return { success: true, data: parsed };
-  } catch (err) {
-    return { success: false, error: `JSON parse error: ${(err as Error).message}` };
+  } catch {
+    // Fallback: If JSON parsing fails, treat the response as a follow-up question
+    // This handles cases where the LLM responds with plain text instead of JSON
+    const trimmedResponse = responseText.trim();
+
+    if (trimmedResponse.length > 0 && trimmedResponse.length < 1000) {
+      // Treat plain text as a follow-up question
+      return {
+        success: true,
+        data: {
+          isComplete: false,
+          followUpQuestion: trimmedResponse,
+        },
+      };
+    }
+
+    return { success: false, error: 'Invalid response format - expected JSON' };
   }
 }

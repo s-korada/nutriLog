@@ -206,10 +206,12 @@ describe('prompts', () => {
       expect(result.data?.followUpQuestion).toBe('Test?');
     });
 
-    it('should return error for invalid JSON', () => {
+    it('should treat short invalid JSON as follow-up question (fallback)', () => {
       const result = parseLLMResponse('not valid json');
-      expect(result.success).toBe(false);
-      expect(result.error).toContain('JSON parse error');
+      // With fallback, short text is treated as a follow-up question
+      expect(result.success).toBe(true);
+      expect(result.data?.isComplete).toBe(false);
+      expect(result.data?.followUpQuestion).toBe('not valid json');
     });
 
     it('should return error for missing isComplete', () => {
@@ -338,6 +340,32 @@ describe('prompts', () => {
       expect(result.success).toBe(true);
       expect(result.data?.components).toHaveLength(1);
       expect(result.data?.overall_category).toBe('processed');
+    });
+
+    // Fallback behavior tests
+    it('should treat plain text as follow-up question (fallback)', () => {
+      const response = 'So the chicken was from a local butcher. Was the biryani made at home or ordered?';
+      const result = parseLLMResponse(response);
+
+      expect(result.success).toBe(true);
+      expect(result.data?.isComplete).toBe(false);
+      expect(result.data?.followUpQuestion).toBe(response);
+    });
+
+    it('should extract JSON from mixed text response', () => {
+      const response = 'Here is my response: {"isComplete": false, "followUpQuestion": "Was it homemade?"}';
+      const result = parseLLMResponse(response);
+
+      expect(result.success).toBe(true);
+      expect(result.data?.isComplete).toBe(false);
+      expect(result.data?.followUpQuestion).toBe('Was it homemade?');
+    });
+
+    it('should reject very long plain text responses', () => {
+      const response = 'a'.repeat(1500); // Too long to be a reasonable follow-up
+      const result = parseLLMResponse(response);
+
+      expect(result.success).toBe(false);
     });
   });
 });
