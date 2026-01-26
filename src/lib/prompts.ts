@@ -482,6 +482,49 @@ export interface ParsedLLMResponse {
  * Supports both legacy single-category and v1.1 component-based formats.
  * Falls back to treating plain text as a follow-up question.
  */
+/**
+ * Extract the first complete JSON object from a string by counting balanced braces.
+ */
+function extractFirstJsonObject(text: string): string | null {
+  const startIndex = text.indexOf('{');
+  if (startIndex === -1) return null;
+
+  let braceCount = 0;
+  let inString = false;
+  let escapeNext = false;
+
+  for (let i = startIndex; i < text.length; i++) {
+    const char = text[i];
+
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+
+    if (char === '\\' && inString) {
+      escapeNext = true;
+      continue;
+    }
+
+    if (char === '"' && !escapeNext) {
+      inString = !inString;
+      continue;
+    }
+
+    if (!inString) {
+      if (char === '{') braceCount++;
+      if (char === '}') {
+        braceCount--;
+        if (braceCount === 0) {
+          return text.substring(startIndex, i + 1);
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 export function parseLLMResponse(responseText: string): {
   success: boolean;
   data?: ParsedLLMResponse;
@@ -494,9 +537,8 @@ export function parseLLMResponse(responseText: string): {
       .replace(/```\n?/g, '')
       .trim();
 
-    // Try to find JSON in the response (in case there's text before/after)
-    const jsonMatch = cleanedResponse.match(/\{[\s\S]*\}/);
-    const jsonToParse = jsonMatch ? jsonMatch[0] : cleanedResponse;
+    // Extract only the first complete JSON object (handles text after JSON)
+    const jsonToParse = extractFirstJsonObject(cleanedResponse) || cleanedResponse;
 
     const parsed = JSON.parse(jsonToParse);
 
