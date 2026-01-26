@@ -2,7 +2,7 @@ import { logAgentActivity, estimateTokens } from './logger';
 import { buildPromptMessages, truncateConversationHistory, parseLLMResponse, SYSTEM_PROMPT, ParsedLLMResponse } from './prompts';
 import type { ChatMessage, LLMCategorizationResponse } from './types';
 
-const MODEL = 'llama-3.1-8b-instant';
+const MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const MAX_CONTEXT_WINDOW = 128000; // Llama 3.1 8B context window
 
