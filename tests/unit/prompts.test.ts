@@ -104,9 +104,12 @@ describe('prompts', () => {
       expect(isValidCategory('processed')).toBe(true);
     });
 
+    it('should accept home_cooked as valid (alias for non_processed)', () => {
+      expect(isValidCategory('home_cooked')).toBe(true);
+    });
+
     it('should return false for invalid categories', () => {
       expect(isValidCategory('invalid')).toBe(false);
-      expect(isValidCategory('home_cooked')).toBe(false);
       expect(isValidCategory('')).toBe(false);
     });
   });

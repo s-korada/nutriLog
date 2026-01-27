@@ -422,9 +422,19 @@ export function truncateConversationHistory(
 
 /**
  * Validate that the LLM response contains a valid category.
+ * Accepts 'home_cooked' as an alias for 'non_processed'.
  */
 export function isValidCategory(category: string): category is MealCategory {
-  return ['non_processed', 'restaurant', 'processed'].includes(category);
+  return ['non_processed', 'restaurant', 'processed', 'home_cooked'].includes(category);
+}
+
+/**
+ * Normalize category to valid MealCategory type.
+ * Converts 'home_cooked' to 'non_processed'.
+ */
+export function normalizeCategory(category: string): MealCategory {
+  if (category === 'home_cooked') return 'non_processed';
+  return category as MealCategory;
 }
 
 /**
@@ -550,7 +560,7 @@ export function parseLLMResponse(responseText: string): {
     if (parsed.isComplete) {
       // v1.1: Check for component-based response first
       if (parsed.components && Array.isArray(parsed.components)) {
-        // Validate each component
+        // Validate and normalize each component
         for (const comp of parsed.components) {
           if (!comp.name || typeof comp.name !== 'string') {
             return { success: false, error: 'Component missing name' };
@@ -558,6 +568,8 @@ export function parseLLMResponse(responseText: string): {
           if (!comp.category || !isValidCategory(comp.category)) {
             return { success: false, error: `Invalid category for component: ${comp.name}` };
           }
+          // Normalize 'home_cooked' to 'non_processed'
+          comp.category = normalizeCategory(comp.category);
         }
 
         // Validate or calculate overall_category
@@ -577,6 +589,8 @@ export function parseLLMResponse(responseText: string): {
       if (!parsed.category || !isValidCategory(parsed.category)) {
         return { success: false, error: 'Invalid or missing category' };
       }
+      // Normalize 'home_cooked' to 'non_processed'
+      parsed.category = normalizeCategory(parsed.category);
 
       return { success: true, data: parsed };
     } else {
