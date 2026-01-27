@@ -9,7 +9,8 @@
     "lint": "eslint",
     "test": "jest",
     "test:watch": "jest --watch",
-    "test:coverage": "jest --coverage"
+    "test:coverage": "jest --coverage",
+    "evals": "tsx tests/evals/run-evals.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.91.1",
@@ -37,6 +38,7 @@
     "sharp": "^0.34.5",
     "tailwindcss": "^4",
     "ts-jest": "^29.4.6",
+    "tsx": "^4.21.0",
     "typescript": "^5"
   }
 }
