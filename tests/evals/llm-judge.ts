@@ -1,11 +1,11 @@
 /**
  * LLM-as-Judge for NutriLog Evaluations
- * Uses Qwen 2.5 72B to evaluate responses from Llama 4 Scout
+ * Uses Qwen3 32B to evaluate responses from Llama 4 Scout
  */
 
 import Groq from 'groq-sdk';
 
-const JUDGE_MODEL = 'qwen/qwen-2.5-72b-instruct';
+const JUDGE_MODEL = 'qwen/qwen3-32b';
 const JUDGE_TEMPERATURE = 0.2;
 
 export interface JudgeResult {
@@ -46,7 +46,7 @@ function buildJudgePrompt(context: EvalContext): string {
   return `You are evaluating responses from a food tracking AI assistant called NutriLog.
 
 ## Your Role
-You are a DIFFERENT model (Qwen 72B) evaluating outputs from another model (Llama 4 Scout 17B).
+You are a DIFFERENT model (Qwen3 32B) evaluating outputs from another model (Llama 4 Scout 17B).
 Be critical but fair. Your job is to catch issues the other model might have.
 
 ## Test Information
